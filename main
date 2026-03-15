@@ -28,9 +28,9 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional
 
 import requests
 from dotenv import load_dotenv
@@ -46,16 +46,6 @@ except ImportError:
         RED = GREEN = YELLOW = CYAN = MAGENTA = WHITE = RESET = ""
     class Style:
         BRIGHT = RESET_ALL = ""
-
-# Dépendances optionnelles pour le mode LIVE
-try:
-    from solders.keypair import Keypair
-    from solders.transaction import VersionedTransaction
-    from solana.rpc.api import Client as SolanaClient
-    from solana.rpc.types import TxOpts
-    HAS_SOLANA = True
-except ImportError:
-    HAS_SOLANA = False
 
 load_dotenv()
 
@@ -102,19 +92,11 @@ class Config:
     HYPE_TRAILING_PCT: float = 0.15  # Trailing 15% sous pic
     HYPE_TIMEOUT_MIN: int    = 120   # Timeout 2h
 
-    # Swap
-    SLIPPAGE_BPS: int      = 300     # 3% slippage toléré
-    MIN_SOL_BALANCE: float = 0.05    # SOL minimum gardé pour les fees réseau
-
     # Général
     DRY_RUN: bool      = True
     LOG_FILE: str      = "sniper_hype.log"
     CSV_FILE: str      = "sniper_trades.csv"
     SCAN_INTERVAL: int = 5           # Secondes entre chaque scan
-
-    @property
-    def HELIUS_RPC_URL(self) -> str:
-        return f"https://mainnet.helius-rpc.com/?api-key={self.HELIUS_API_KEY}"
 
 
 CFG = Config()
