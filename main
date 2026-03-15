@@ -1,0 +1,668 @@
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║        SOLANA SNIPER + HYPE BOT — Pump.fun / Raydium            ║
+║                                                                  ║
+║  Module 1 : SNIPER  — achète dans les 30s après création        ║
+║  Module 2 : HYPE    — détecte les tokens en accélération        ║
+║                                                                  ║
+║  INSTALLATION :                                                  ║
+║    pip install requests websockets aiohttp python-dotenv colorama║
+║                                                                  ║
+║  CONFIG (.env) :                                                 ║
+║    HELIUS_API_KEY=ta_cle_helius  (gratuit sur helius.dev)        ║
+║    WALLET_PRIVATE_KEY=ta_cle_privee_en_base58  (pour LIVE)      ║
+║                                                                  ║
+║  USAGE :                                                         ║
+║    py solana_sniper_hype_bot.py           # dry run (défaut)    ║
+║    py solana_sniper_hype_bot.py --live    # vrais achats         ║
+║                                                                  ║
+║  [!]  RISQUE EXTRÊME — uniquement du capital que tu peux perdre  ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+
+import argparse
+import asyncio
+import csv
+import logging
+import os
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+import requests
+from dotenv import load_dotenv
+
+try:
+    import colorama
+    from colorama import Fore, Style
+    colorama.init()
+    HAS_COLOR = True
+except ImportError:
+    HAS_COLOR = False
+    class Fore:
+        RED = GREEN = YELLOW = CYAN = MAGENTA = WHITE = RESET = ""
+    class Style:
+        BRIGHT = RESET_ALL = ""
+
+load_dotenv()
+
+
+# ================================================================
+# CONFIG
+# ================================================================
+@dataclass
+class Config:
+    # RPC & APIs
+    HELIUS_API_KEY: str = os.getenv("HELIUS_API_KEY", "")
+    PRIVATE_KEY: str    = os.getenv("WALLET_PRIVATE_KEY", "")
+
+    # Capital — commence PETIT
+    SNIPER_BUY_SOL: float  = 0.05    # ~5 USD par trade sniper
+    HYPE_BUY_SOL: float    = 0.10    # ~10 USD par trade hype
+    MAX_POSITIONS: int     = 5       # Positions simultanées max
+    MAX_DAILY_SOL: float   = 1.0     # Budget journalier max
+
+    # Filtres anti-rug (sniper)
+    MIN_LIQUIDITY_USD: float       = 500.0    # Liquidité mini en USD
+    MAX_DEV_WALLET_PCT: float      = 0.10     # Dev < 10% du supply
+    REQUIRE_SOCIALS: bool          = False    # Exiger Twitter/site
+    MAX_MCAP_SNIPER_USD: float     = 100_000  # MCap max pour sniper
+    SNIPER_WINDOW_SEC: int         = 30       # Fenêtre d'achat après création
+
+    # TP/SL sniper
+    SNIPER_TP_MULT: float   = 3.0    # Vendre si x3
+    SNIPER_SL_PCT: float    = 0.50   # Stop loss -50%
+    SNIPER_SELL_PART: float = 0.50   # Vendre 50% au TP1
+    SNIPER_TIMEOUT_MIN: int = 60     # Timeout 60min
+
+    # Filtres hype
+    HYPE_MIN_AGE_MIN: int   = 5      # Token min 5min
+    HYPE_MAX_AGE_H: int     = 48     # Token max 48h (en heures)
+    HYPE_MAX_AGE_MIN: int   = 20     # Token max 20min pour hype frais
+    HYPE_MIN_VOL_USD: float = 10_000 # Volume 5min mini
+    HYPE_PRICE_ACCEL: float = 0.30   # +30% en 5min (plus sélectif)
+    HYPE_MAX_MCAP_USD: float = 5_000_000  # MCap max 5M
+
+    # TP/SL hype
+    HYPE_TP_MULT: float      = 2.0   # TP x2
+    HYPE_SL_PCT: float       = 0.25  # SL -25%
+    HYPE_TRAILING_PCT: float = 0.15  # Trailing 15% sous pic
+    HYPE_TIMEOUT_MIN: int    = 120   # Timeout 2h
+
+    # Général
+    DRY_RUN: bool      = True
+    LOG_FILE: str      = "sniper_hype.log"
+    CSV_FILE: str      = "sniper_trades.csv"
+    SCAN_INTERVAL: int = 5           # Secondes entre chaque scan
+
+
+CFG = Config()
+
+
+# ================================================================
+# LOGGING
+# ================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(CFG.LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+log = logging.getLogger("SOL_BOT")
+
+
+def cprint(msg: str, color: str = "", bright: bool = False):
+    try:
+        # Encoder en ASCII safe pour Windows
+        safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
+        if HAS_COLOR:
+            prefix = Style.BRIGHT if bright else ""
+            print(f"{prefix}{color}{safe_msg}{Style.RESET_ALL}")
+        else:
+            print(safe_msg)
+    except Exception:
+        pass
+
+
+# ================================================================
+# DEXSCREENER API (gratuit, pas de clé)
+# ================================================================
+class DexScreener:
+    BASE = "https://api.dexscreener.com/latest/dex"
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = "Mozilla/5.0"
+
+    def _get(self, url: str) -> dict:
+        try:
+            r = self.session.get(url, timeout=10)
+            return r.json()
+        except Exception as e:
+            log.debug(f"DexScreener: {e}")
+            return {}
+
+    def get_pairs_by_token(self, mint: str) -> list:
+        data = self._get(f"{self.BASE}/tokens/{mint}")
+        return data.get("pairs", [])
+
+    def get_new_pairs_solana(self) -> list:
+        data = self._get(f"{self.BASE}/pairs/solana")
+        return data.get("pairs", [])
+
+    def get_boosted_tokens(self) -> list:
+        try:
+            r = self.session.get(
+                "https://api.dexscreener.com/token-boosts/latest/v1", timeout=10
+            )
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except:
+            return []
+
+
+# ================================================================
+# PUMP.FUN API (gratuit)
+# ================================================================
+class PumpFunAPI:
+    BASE = "https://frontend-api.pump.fun"
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = "Mozilla/5.0"
+
+    def get_latest_tokens(self, limit: int = 50) -> list:
+        try:
+            r = self.session.get(
+                f"{self.BASE}/coins/latest",
+                params={"limit": limit, "includeNsfw": False},
+                timeout=10
+            )
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            log.debug(f"PumpFun: {e}")
+            return []
+
+    def get_king_of_hill(self) -> list:
+        """Tokens proches de graduation vers Raydium."""
+        try:
+            r = self.session.get(
+                f"{self.BASE}/coins",
+                params={"limit": 20, "sort": "market_cap",
+                        "order": "DESC", "includeNsfw": False},
+                timeout=10
+            )
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except:
+            return []
+
+
+# ================================================================
+# FILTRES ANTI-RUG
+# ================================================================
+class RugFilter:
+    def check_pumpfun(self, token: dict) -> tuple:
+        """Vérifie un token Pump.fun. Retourne (ok, raison)."""
+        if token.get("dev_sold"):
+            return False, "Dev a vendu"
+
+        if CFG.REQUIRE_SOCIALS:
+            if not token.get("twitter") and not token.get("website"):
+                return False, "Pas de socials"
+
+        bonding_pct = float(token.get("bonding_curve_progress", 0))
+        if bonding_pct > 95:
+            return False, "Bonding curve > 95% (trop tard)"
+
+        return True, ""
+
+    def check_pair(self, pair: dict, mode: str = "SNIPER") -> tuple:
+        """Vérifie une paire DexScreener."""
+        if pair.get("chainId") != "solana":
+            return False, "Pas Solana"
+
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+        if liq < CFG.MIN_LIQUIDITY_USD:
+            return False, f"Liquidité ${liq:.0f} < ${CFG.MIN_LIQUIDITY_USD}"
+
+        mcap = float(pair.get("marketCap") or 0)
+        max_mcap = CFG.MAX_MCAP_SNIPER_USD if mode == "SNIPER" else CFG.HYPE_MAX_MCAP_USD
+        if mcap > max_mcap:
+            return False, f"MCap ${mcap:,.0f} > ${max_mcap:,.0f}"
+
+        txns = (pair.get("txns") or {}).get("m5") or {}
+        buys  = int(txns.get("buys") or 0)
+        sells = int(txns.get("sells") or 0)
+        if buys + sells > 0 and sells > buys * 2:
+            return False, f"Dump en cours ({buys}B/{sells}S)"
+        # Exiger un minimum d'acheteurs (evite les faux signaux)
+        if mode == "HYPE" and buys < 10:
+            return False, f"Pas assez d'acheteurs: {buys}"
+
+        return True, ""
+
+
+# ================================================================
+# POSITION MANAGER
+# ================================================================
+@dataclass
+class Position:
+    mint: str
+    symbol: str
+    name: str
+    entry_price: float
+    entry_time: float
+    sol_invested: float
+    strategy: str
+    peak_price: float = 0.0
+    partial_sold: bool = False
+    status: str = "OPEN"
+    exit_price: float = 0.0
+    exit_reason: str = ""
+    pnl_sol: float = 0.0
+
+
+class PositionManager:
+    def __init__(self):
+        self.positions: dict = {}
+        self.closed: list    = []
+        self.daily_sol       = 0.0
+        self.day             = datetime.now().date()
+
+    def _reset_daily(self):
+        today = datetime.now().date()
+        if today != self.day:
+            self.daily_sol = 0.0
+            self.day = today
+
+    def can_open(self, sol: float) -> tuple:
+        self._reset_daily()
+        if len(self.positions) >= CFG.MAX_POSITIONS:
+            return False, f"Max {CFG.MAX_POSITIONS} positions atteint"
+        if self.daily_sol + sol > CFG.MAX_DAILY_SOL:
+            return False, f"Budget journalier {self.daily_sol:.3f}/{CFG.MAX_DAILY_SOL} SOL"
+        return True, ""
+
+    def open(self, pos: Position):
+        self.positions[pos.mint] = pos
+        self.daily_sol += pos.sol_invested
+        self._log_csv("OPEN", pos)
+
+    def close(self, mint: str, price: float, reason: str) -> Optional[Position]:
+        pos = self.positions.pop(mint, None)
+        if not pos:
+            return None
+        pos.status      = "CLOSED"
+        pos.exit_price  = price
+        pos.exit_reason = reason
+        mult = price / pos.entry_price if pos.entry_price else 0
+        pos.pnl_sol     = pos.sol_invested * (mult - 1)
+        self.closed.append(pos)
+        self._log_csv("CLOSE", pos)
+        return pos
+
+    def _log_csv(self, action: str, pos: Position):
+        row = {
+            "datetime":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "action":      action,
+            "strategy":    pos.strategy,
+            "mint":        pos.mint,
+            "symbol":      pos.symbol,
+            "entry_price": pos.entry_price,
+            "exit_price":  pos.exit_price,
+            "sol_invested": pos.sol_invested,
+            "pnl_sol":     pos.pnl_sol,
+            "exit_reason": pos.exit_reason,
+            "dry_run":     CFG.DRY_RUN,
+        }
+        exists = os.path.exists(CFG.CSV_FILE)
+        with open(CFG.CSV_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=row.keys())
+            if not exists:
+                w.writeheader()
+            w.writerow(row)
+
+    def summary(self) -> str:
+        total_pnl = sum(p.pnl_sol for p in self.closed)
+        wins  = sum(1 for p in self.closed if p.pnl_sol > 0)
+        total = len(self.closed)
+        wr    = wins / total * 100 if total else 0
+        return (
+            f"Trades: {total} | WR: {wr:.0f}% | "
+            f"PnL: {total_pnl:+.4f} SOL | "
+            f"Open: {len(self.positions)}"
+        )
+
+
+# ================================================================
+# MODULE 1 — SNIPER
+# ================================================================
+class SniperBot:
+    def __init__(self, pm: PositionManager, dex: DexScreener,
+                 pump: PumpFunAPI, rug: RugFilter):
+        self.pm   = pm
+        self.dex  = dex
+        self.pump = pump
+        self.rug  = rug
+        self.seen: set = set()
+
+    async def scan(self):
+        tokens = self.pump.get_latest_tokens(50)
+        now    = time.time()
+
+        for token in tokens:
+            mint = token.get("mint", "")
+            if not mint or mint in self.seen:
+                continue
+
+            created = (token.get("created_timestamp") or 0) / 1000
+            age_sec = now - created
+
+            if age_sec > CFG.SNIPER_WINDOW_SEC:
+                self.seen.add(mint)
+                continue
+
+            ok, reason = self.rug.check_pumpfun(token)
+            if not ok:
+                self.seen.add(mint)
+                continue
+
+            pairs = self.dex.get_pairs_by_token(mint)
+            if not pairs:
+                self.seen.add(mint)
+                continue
+
+            pair = pairs[0]
+            ok2, reason2 = self.rug.check_pair(pair, "SNIPER")
+            if not ok2:
+                self.seen.add(mint)
+                continue
+
+            can, reason3 = self.pm.can_open(CFG.SNIPER_BUY_SOL)
+            if not can:
+                self.seen.add(mint)
+                continue
+
+            price  = float(pair.get("priceNative") or 0)
+            symbol = (pair.get("baseToken") or {}).get("symbol", "???")
+            name   = (pair.get("baseToken") or {}).get("name", "???")
+            mcap   = float(pair.get("marketCap") or 0)
+
+            await self._buy(mint, symbol, name, price, mcap, age_sec)
+            self.seen.add(mint)
+
+    async def _buy(self, mint, symbol, name, price, mcap, age_sec):
+        pos = Position(
+            mint=mint, symbol=symbol, name=name,
+            entry_price=price, entry_time=time.time(),
+            sol_invested=CFG.SNIPER_BUY_SOL,
+            strategy="SNIPER", peak_price=price,
+        )
+
+        label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
+        cprint(f"\n[SNIPER {label}] {symbol} ({name})", Fore.CYAN, bright=True)
+        cprint(f"   Age: {age_sec:.0f}s | MCap: ${mcap:,.0f} | Prix: {price:.10f} SOL", Fore.CYAN)
+        cprint(f"   TP: x{CFG.SNIPER_TP_MULT} | SL: -{CFG.SNIPER_SL_PCT*100:.0f}% | {CFG.SNIPER_BUY_SOL} SOL investi", Fore.CYAN)
+
+        if not CFG.DRY_RUN:
+            # Ici : intégrer Jupiter swap
+            # result = await jupiter_swap(mint, CFG.SNIPER_BUY_SOL)
+            pass
+
+        self.pm.open(pos)
+
+    async def monitor(self):
+        sniper_pos = {k: v for k, v in self.pm.positions.items()
+                      if v.strategy == "SNIPER"}
+        if not sniper_pos:
+            return
+
+        for mint, pos in list(sniper_pos.items()):
+            pairs = self.dex.get_pairs_by_token(mint)
+            if not pairs:
+                continue
+
+            price   = float(pairs[0].get("priceNative") or pos.entry_price)
+            mult    = price / pos.entry_price if pos.entry_price else 0
+            dur_min = (time.time() - pos.entry_time) / 60
+
+            pos.peak_price = max(pos.peak_price, price)
+            reason = None
+
+            # TP partiel
+            if not pos.partial_sold and mult >= CFG.SNIPER_TP_MULT:
+                pos.partial_sold = True
+                cprint(f"  [SNIPER] {pos.symbol} TP1 x{mult:.1f} — vente partielle 50%", Fore.GREEN)
+
+            # Trailing stop après TP1
+            if pos.partial_sold:
+                trail = pos.peak_price * 0.75
+                if price <= trail:
+                    reason = f"TRAILING (pic x{pos.peak_price/pos.entry_price:.1f})"
+
+            if mult <= (1 - CFG.SNIPER_SL_PCT):
+                reason = f"SL -{CFG.SNIPER_SL_PCT*100:.0f}%"
+
+            if dur_min >= CFG.SNIPER_TIMEOUT_MIN:
+                reason = f"TIMEOUT {dur_min:.0f}min"
+
+            if reason:
+                closed = self.pm.close(mint, price, reason)
+                if closed:
+                    ok = closed.pnl_sol > 0
+                    emoji = "OK" if ok else "XX"
+                    color = Fore.GREEN if ok else Fore.RED
+                    cprint(f"  [{emoji}][SNIPER] {pos.symbol} — {reason} | x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL", color, bright=True)
+
+
+# ================================================================
+# MODULE 2 — HYPE DETECTOR
+# ================================================================
+class HypeBot:
+    def __init__(self, pm: PositionManager, dex: DexScreener, rug: RugFilter):
+        self.pm       = pm
+        self.dex      = dex
+        self.rug      = rug
+        self.seen_today: set = set()
+
+    async def scan(self):
+        sources = [
+            (self.dex.get_boosted_tokens(), "BOOST"),
+            (self.dex.get_new_pairs_solana(), "NEW"),
+        ]
+        for tokens, source in sources:
+            await self._analyze(tokens, source)
+
+    async def _analyze(self, items: list, source: str):
+        now = time.time()
+        for item in items:
+            mint = (item.get("tokenAddress") or
+                    (item.get("baseToken") or {}).get("address", ""))
+            if not mint or mint in self.pm.positions or mint in self.seen_today:
+                continue
+
+            pairs = self.dex.get_pairs_by_token(mint)
+            if not pairs:
+                continue
+
+            pairs = sorted(
+                pairs,
+                key=lambda p: float((p.get("volume") or {}).get("h24") or 0),
+                reverse=True
+            )
+            pair = pairs[0]
+
+            created = (pair.get("pairCreatedAt") or 0) / 1000
+            age_min = (now - created) / 60
+            age_h   = age_min / 60
+
+            if age_min < CFG.HYPE_MIN_AGE_MIN:
+                continue
+            if age_min > 20:   # Max 20min — apres c'est souvent deja pompe
+                continue
+            if age_h > CFG.HYPE_MAX_AGE_H:
+                continue
+
+            vol5m = float((pair.get("volume") or {}).get("m5") or 0)
+            if vol5m < CFG.HYPE_MIN_VOL_USD:
+                continue
+
+            change5m = float((pair.get("priceChange") or {}).get("m5") or 0)
+            if change5m < CFG.HYPE_PRICE_ACCEL * 100:
+                continue
+
+            ok, reason = self.rug.check_pair(pair, "HYPE")
+            if not ok:
+                continue
+
+            can, reason2 = self.pm.can_open(CFG.HYPE_BUY_SOL)
+            if not can:
+                continue
+
+            price  = float(pair.get("priceNative") or 0)
+            symbol = (pair.get("baseToken") or {}).get("symbol", "???")
+            name   = (pair.get("baseToken") or {}).get("name", "???")
+            mcap   = float(pair.get("marketCap") or 0)
+
+            await self._buy(mint, symbol, name, price, age_min, change5m, vol5m, mcap, source)
+            self.seen_today.add(mint)
+
+    async def _buy(self, mint, symbol, name, price, age_min, change5m, vol5m, mcap, source):
+        pos = Position(
+            mint=mint, symbol=symbol, name=name,
+            entry_price=price, entry_time=time.time(),
+            sol_invested=CFG.HYPE_BUY_SOL,
+            strategy="HYPE", peak_price=price,
+        )
+
+        label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
+        cprint(f"\n[HYPE {label}] {symbol} ({name}) [{source}]", Fore.MAGENTA, bright=True)
+        cprint(f"   Age: {age_min:.0f}min | +{change5m:.1f}% en 5min | Vol5m: ${vol5m:,.0f}", Fore.MAGENTA)
+        cprint(f"   MCap: ${mcap:,.0f} | TP: x{CFG.HYPE_TP_MULT} | SL: -{CFG.HYPE_SL_PCT*100:.0f}%", Fore.MAGENTA)
+
+        if not CFG.DRY_RUN:
+            # Ici : intégrer Jupiter swap
+            pass
+
+        self.pm.open(pos)
+
+    async def monitor(self):
+        hype_pos = {k: v for k, v in self.pm.positions.items()
+                    if v.strategy == "HYPE"}
+        if not hype_pos:
+            return
+
+        for mint, pos in list(hype_pos.items()):
+            pairs = self.dex.get_pairs_by_token(mint)
+            if not pairs:
+                continue
+
+            price   = float(pairs[0].get("priceNative") or pos.entry_price)
+            mult    = price / pos.entry_price if pos.entry_price else 0
+            dur_min = (time.time() - pos.entry_time) / 60
+
+            pos.peak_price = max(pos.peak_price, price)
+            reason = None
+
+            if mult >= CFG.HYPE_TP_MULT:
+                reason = f"TP x{mult:.1f}"
+
+            if mult >= 1.10:
+                trail = pos.peak_price * (1 - CFG.HYPE_TRAILING_PCT)
+                if price <= trail:
+                    reason = f"TRAILING (pic x{pos.peak_price/pos.entry_price:.1f})"
+
+            if mult <= (1 - CFG.HYPE_SL_PCT):
+                reason = f"SL -{CFG.HYPE_SL_PCT*100:.0f}%"
+
+            if dur_min >= CFG.HYPE_TIMEOUT_MIN:
+                reason = f"TIMEOUT {dur_min:.0f}min"
+
+            if reason:
+                closed = self.pm.close(mint, price, reason)
+                if closed:
+                    ok = closed.pnl_sol > 0
+                    emoji = "OK" if ok else "XX"
+                    color = Fore.GREEN if ok else Fore.RED
+                    cprint(f"  [{emoji}][HYPE] {pos.symbol} — {reason} | x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL", color, bright=True)
+
+
+# ================================================================
+# BOUCLE PRINCIPALE
+# ================================================================
+async def main_loop():
+    dex  = DexScreener()
+    pump = PumpFunAPI()
+    rug  = RugFilter()
+    pm   = PositionManager()
+
+    sniper = SniperBot(pm, dex, pump, rug)
+    hype   = HypeBot(pm, dex, rug)
+
+    mode = "DRY RUN" if CFG.DRY_RUN else "LIVE"
+    cprint("=" * 60, Fore.WHITE, bright=True)
+    cprint(f"  SOLANA SNIPER + HYPE BOT — {mode}", Fore.CYAN, bright=True)
+    cprint(f"  Sniper : {CFG.SNIPER_BUY_SOL} SOL | TP x{CFG.SNIPER_TP_MULT} | SL -{CFG.SNIPER_SL_PCT*100:.0f}%", Fore.WHITE)
+    cprint(f"  Hype   : {CFG.HYPE_BUY_SOL} SOL | TP x{CFG.HYPE_TP_MULT} | SL -{CFG.HYPE_SL_PCT*100:.0f}%", Fore.WHITE)
+    cprint(f"  Budget max/jour : {CFG.MAX_DAILY_SOL} SOL", Fore.WHITE)
+    cprint("=" * 60, Fore.WHITE, bright=True)
+
+    cycle = 0
+    while True:
+        cycle += 1
+        try:
+            await sniper.scan()
+            await hype.scan()
+            await sniper.monitor()
+            await hype.monitor()
+
+            if cycle % 12 == 0:
+                cprint(f"  [{datetime.now().strftime('%H:%M:%S')}] {pm.summary()}", Fore.WHITE)
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            log.error(f"Erreur: {e}", exc_info=True)
+
+        await asyncio.sleep(CFG.SCAN_INTERVAL)
+
+    cprint(f"\n  Arrêt — {pm.summary()}", Fore.WHITE, bright=True)
+
+
+# ================================================================
+# MAIN
+# ================================================================
+def main():
+    parser = argparse.ArgumentParser(description="Solana Sniper + Hype Bot")
+    parser.add_argument("--live",        action="store_true", help="Vrais achats")
+    parser.add_argument("--sniper-sol",  type=float, help="SOL par trade sniper")
+    parser.add_argument("--hype-sol",    type=float, help="SOL par trade hype")
+    parser.add_argument("--max-daily",   type=float, help="Budget journalier max SOL")
+    parser.add_argument("--require-socials", action="store_true")
+    args = parser.parse_args()
+
+    if args.sniper_sol:       CFG.SNIPER_BUY_SOL   = args.sniper_sol
+    if args.hype_sol:         CFG.HYPE_BUY_SOL      = args.hype_sol
+    if args.max_daily:        CFG.MAX_DAILY_SOL      = args.max_daily
+    if args.require_socials:  CFG.REQUIRE_SOCIALS    = True
+
+    if args.live:
+        if not CFG.PRIVATE_KEY:
+            print("Clé privée manquante dans .env")
+            sys.exit(1)
+        confirm = input("Mode LIVE — vrais SOL depenses. Confirmer ? (oui/non) : ")
+        if confirm.strip().lower() != "oui":
+            sys.exit(0)
+        CFG.DRY_RUN = False
+
+    asyncio.run(main_loop())
+
+
+if __name__ == "__main__":
+    main()
