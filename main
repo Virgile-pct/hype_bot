@@ -6,15 +6,15 @@
 ║  Module 2 : HYPE    — détecte les tokens en accélération        ║
 ║                                                                  ║
 ║  INSTALLATION :                                                  ║
-║    pip install requests websockets aiohttp python-dotenv colorama║
+║    pip install -r requirements.txt                               ║
 ║                                                                  ║
 ║  CONFIG (.env) :                                                 ║
 ║    HELIUS_API_KEY=ta_cle_helius  (gratuit sur helius.dev)        ║
 ║    WALLET_PRIVATE_KEY=ta_cle_privee_en_base58  (pour LIVE)      ║
 ║                                                                  ║
 ║  USAGE :                                                         ║
-║    py solana_sniper_hype_bot.py           # dry run (défaut)    ║
-║    py solana_sniper_hype_bot.py --live    # vrais achats         ║
+║    python main           # dry run (défaut, sans risque)        ║
+║    python main --live    # vrais achats                          ║
 ║                                                                  ║
 ║  [!]  RISQUE EXTRÊME — uniquement du capital que tu peux perdre  ║
 ╚══════════════════════════════════════════════════════════════════╝
@@ -22,6 +22,7 @@
 
 import argparse
 import asyncio
+import base64
 import csv
 import logging
 import os
@@ -117,7 +118,6 @@ log = logging.getLogger("SOL_BOT")
 
 def cprint(msg: str, color: str = "", bright: bool = False):
     try:
-        # Encoder en ASCII safe pour Windows
         safe_msg = msg.encode('ascii', errors='replace').decode('ascii')
         if HAS_COLOR:
             prefix = Style.BRIGHT if bright else ""
@@ -126,6 +126,160 @@ def cprint(msg: str, color: str = "", bright: bool = False):
             print(safe_msg)
     except Exception:
         pass
+
+
+# ================================================================
+# WALLET MANAGER
+# ================================================================
+class WalletManager:
+    """Gère le keypair Solana et vérifie le solde avant chaque trade."""
+
+    def __init__(self, private_key_b58: str, rpc_url: str):
+        if not HAS_SOLANA:
+            raise RuntimeError(
+                "Dépendances manquantes. Lance : pip install solders solana"
+            )
+        if not private_key_b58:
+            raise ValueError("WALLET_PRIVATE_KEY manquant dans .env")
+        try:
+            self.keypair = Keypair.from_base58_string(private_key_b58)
+        except Exception as e:
+            raise ValueError(f"Clé privée invalide (doit être en base58) : {e}")
+
+        self.pubkey = str(self.keypair.pubkey())
+        self._rpc   = SolanaClient(rpc_url)
+        log.info(f"Wallet chargé : {self.pubkey}")
+
+    def get_balance_sol(self) -> float:
+        try:
+            resp = self._rpc.get_balance(self.keypair.pubkey())
+            return resp.value / 1_000_000_000
+        except Exception as e:
+            log.error(f"Impossible de lire le solde : {e}")
+            return 0.0
+
+    def check_balance(self, sol_needed: float) -> Tuple[bool, str]:
+        balance = self.get_balance_sol()
+        required = sol_needed + CFG.MIN_SOL_BALANCE
+        if balance < required:
+            return False, (
+                f"Solde insuffisant : {balance:.4f} SOL "
+                f"(besoin {required:.4f} SOL dont {CFG.MIN_SOL_BALANCE} pour les fees)"
+            )
+        return True, f"Solde OK : {balance:.4f} SOL"
+
+
+# ================================================================
+# JUPITER SWAP
+# ================================================================
+WSOL_MINT       = "So11111111111111111111111111111111111111112"
+JUPITER_QUOTE   = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP    = "https://quote-api.jup.ag/v6/swap"
+
+
+class JupiterSwap:
+    """Exécute des swaps SOL <-> token via Jupiter Aggregator."""
+
+    def __init__(self, wallet: WalletManager):
+        self.wallet  = wallet
+        self._rpc    = wallet._rpc
+        self.session = requests.Session()
+        self.session.headers["Content-Type"] = "application/json"
+        self.session.headers["User-Agent"]   = "Mozilla/5.0"
+
+    def _get_quote(self, input_mint: str, output_mint: str, amount_lamports: int) -> Optional[dict]:
+        params = {
+            "inputMint":    input_mint,
+            "outputMint":   output_mint,
+            "amount":       amount_lamports,
+            "slippageBps":  CFG.SLIPPAGE_BPS,
+        }
+        for attempt in range(3):
+            try:
+                r = self.session.get(JUPITER_QUOTE, params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                if "error" in data:
+                    log.warning(f"Jupiter quote : {data['error']}")
+                    return None
+                return data
+            except Exception as e:
+                if attempt == 2:
+                    log.error(f"Jupiter quote échoué après 3 tentatives : {e}")
+                    return None
+                time.sleep(2 ** attempt)
+        return None
+
+    def _send_swap(self, quote: dict) -> Optional[Tuple[str, int]]:
+        """Envoie la transaction de swap. Retourne (signature, out_amount) ou None."""
+        payload = {
+            "quoteResponse":              quote,
+            "userPublicKey":              self.wallet.pubkey,
+            "wrapAndUnwrapSol":           True,
+            "dynamicComputeUnitLimit":    True,
+            "prioritizationFeeLamports":  "auto",
+        }
+        for attempt in range(3):
+            try:
+                r = self.session.post(JUPITER_SWAP, json=payload, timeout=15)
+                r.raise_for_status()
+                swap_data = r.json()
+
+                tx_bytes   = base64.b64decode(swap_data["swapTransaction"])
+                tx         = VersionedTransaction.from_bytes(tx_bytes)
+                signed_tx  = VersionedTransaction(tx.message, [self.wallet.keypair])
+
+                opts = TxOpts(skip_preflight=False, preflight_commitment="confirmed")
+                resp = self._rpc.send_raw_transaction(bytes(signed_tx), opts=opts)
+                sig  = str(resp.value)
+
+                out_amount = int(quote.get("outAmount", 0))
+                log.info(f"Transaction confirmée : https://solscan.io/tx/{sig}")
+                return sig, out_amount
+
+            except Exception as e:
+                if attempt == 2:
+                    log.error(f"Swap échoué après 3 tentatives : {e}")
+                    return None
+                time.sleep(2 ** attempt)
+        return None
+
+    def buy(self, token_mint: str, sol_amount: float) -> Optional[Tuple[str, int]]:
+        """Achète token_mint avec sol_amount SOL.
+        Retourne (signature_tx, token_amount_reçu) ou None si échec."""
+        ok, msg = self.wallet.check_balance(sol_amount)
+        if not ok:
+            log.warning(f"Achat annulé — {msg}")
+            return None
+
+        lamports = int(sol_amount * 1_000_000_000)
+        quote = self._get_quote(WSOL_MINT, token_mint, lamports)
+        if not quote:
+            return None
+
+        result = self._send_swap(quote)
+        if result:
+            sig, out_amount = result
+            cprint(f"   Achat OK : {out_amount} tokens | tx: {sig[:16]}...", Fore.GREEN)
+        return result
+
+    def sell(self, token_mint: str, token_amount: int) -> Optional[str]:
+        """Vend token_amount (unités brutes) contre SOL.
+        Retourne la signature ou None si échec."""
+        if token_amount <= 0:
+            log.warning("sell() appelé avec token_amount <= 0, ignoré")
+            return None
+
+        quote = self._get_quote(token_mint, WSOL_MINT, token_amount)
+        if not quote:
+            return None
+
+        result = self._send_swap(quote)
+        if result:
+            sig, sol_received = result
+            cprint(f"   Vente OK : {sol_received / 1e9:.4f} SOL récupérés | tx: {sig[:16]}...", Fore.GREEN)
+            return sig
+        return None
 
 
 # ================================================================
@@ -139,12 +293,17 @@ class DexScreener:
         self.session.headers["User-Agent"] = "Mozilla/5.0"
 
     def _get(self, url: str) -> dict:
-        try:
-            r = self.session.get(url, timeout=10)
-            return r.json()
-        except Exception as e:
-            log.debug(f"DexScreener: {e}")
-            return {}
+        for attempt in range(3):
+            try:
+                r = self.session.get(url, timeout=10)
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                if attempt == 2:
+                    log.debug(f"DexScreener: {e}")
+                    return {}
+                time.sleep(2 ** attempt)
+        return {}
 
     def get_pairs_by_token(self, mint: str) -> list:
         data = self._get(f"{self.BASE}/tokens/{mint}")
@@ -155,14 +314,20 @@ class DexScreener:
         return data.get("pairs", [])
 
     def get_boosted_tokens(self) -> list:
-        try:
-            r = self.session.get(
-                "https://api.dexscreener.com/token-boosts/latest/v1", timeout=10
-            )
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except:
-            return []
+        for attempt in range(3):
+            try:
+                r = self.session.get(
+                    "https://api.dexscreener.com/token-boosts/latest/v1", timeout=10
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data if isinstance(data, list) else []
+            except Exception as e:
+                if attempt == 2:
+                    log.debug(f"DexScreener boosts: {e}")
+                    return []
+                time.sleep(2 ** attempt)
+        return []
 
 
 # ================================================================
@@ -176,17 +341,22 @@ class PumpFunAPI:
         self.session.headers["User-Agent"] = "Mozilla/5.0"
 
     def get_latest_tokens(self, limit: int = 50) -> list:
-        try:
-            r = self.session.get(
-                f"{self.BASE}/coins/latest",
-                params={"limit": limit, "includeNsfw": False},
-                timeout=10
-            )
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception as e:
-            log.debug(f"PumpFun: {e}")
-            return []
+        for attempt in range(3):
+            try:
+                r = self.session.get(
+                    f"{self.BASE}/coins/latest",
+                    params={"limit": limit, "includeNsfw": False},
+                    timeout=10
+                )
+                r.raise_for_status()
+                data = r.json()
+                return data if isinstance(data, list) else []
+            except Exception as e:
+                if attempt == 2:
+                    log.debug(f"PumpFun: {e}")
+                    return []
+                time.sleep(2 ** attempt)
+        return []
 
     def get_king_of_hill(self) -> list:
         """Tokens proches de graduation vers Raydium."""
@@ -207,7 +377,7 @@ class PumpFunAPI:
 # FILTRES ANTI-RUG
 # ================================================================
 class RugFilter:
-    def check_pumpfun(self, token: dict) -> tuple:
+    def check_pumpfun(self, token: dict) -> Tuple[bool, str]:
         """Vérifie un token Pump.fun. Retourne (ok, raison)."""
         if token.get("dev_sold"):
             return False, "Dev a vendu"
@@ -222,7 +392,7 @@ class RugFilter:
 
         return True, ""
 
-    def check_pair(self, pair: dict, mode: str = "SNIPER") -> tuple:
+    def check_pair(self, pair: dict, mode: str = "SNIPER") -> Tuple[bool, str]:
         """Vérifie une paire DexScreener."""
         if pair.get("chainId") != "solana":
             return False, "Pas Solana"
@@ -241,7 +411,6 @@ class RugFilter:
         sells = int(txns.get("sells") or 0)
         if buys + sells > 0 and sells > buys * 2:
             return False, f"Dump en cours ({buys}B/{sells}S)"
-        # Exiger un minimum d'acheteurs (evite les faux signaux)
         if mode == "HYPE" and buys < 10:
             return False, f"Pas assez d'acheteurs: {buys}"
 
@@ -266,6 +435,9 @@ class Position:
     exit_price: float = 0.0
     exit_reason: str = ""
     pnl_sol: float = 0.0
+    # Mode LIVE : suivi des tokens détenus
+    token_amount: int = 0      # Quantité brute de tokens achetés
+    tx_sig_buy: str   = ""     # Signature transaction d'achat
 
 
 class PositionManager:
@@ -281,7 +453,7 @@ class PositionManager:
             self.daily_sol = 0.0
             self.day = today
 
-    def can_open(self, sol: float) -> tuple:
+    def can_open(self, sol: float) -> Tuple[bool, str]:
         self._reset_daily()
         if len(self.positions) >= CFG.MAX_POSITIONS:
             return False, f"Max {CFG.MAX_POSITIONS} positions atteint"
@@ -320,6 +492,7 @@ class PositionManager:
             "pnl_sol":     pos.pnl_sol,
             "exit_reason": pos.exit_reason,
             "dry_run":     CFG.DRY_RUN,
+            "tx_buy":      pos.tx_sig_buy,
         }
         exists = os.path.exists(CFG.CSV_FILE)
         with open(CFG.CSV_FILE, "a", newline="", encoding="utf-8") as f:
@@ -345,11 +518,13 @@ class PositionManager:
 # ================================================================
 class SniperBot:
     def __init__(self, pm: PositionManager, dex: DexScreener,
-                 pump: PumpFunAPI, rug: RugFilter):
-        self.pm   = pm
-        self.dex  = dex
-        self.pump = pump
-        self.rug  = rug
+                 pump: PumpFunAPI, rug: RugFilter,
+                 jupiter: Optional[JupiterSwap] = None):
+        self.pm      = pm
+        self.dex     = dex
+        self.pump    = pump
+        self.rug     = rug
+        self.jupiter = jupiter
         self.seen: set = set()
 
     async def scan(self):
@@ -398,23 +573,29 @@ class SniperBot:
             self.seen.add(mint)
 
     async def _buy(self, mint, symbol, name, price, mcap, age_sec):
-        pos = Position(
-            mint=mint, symbol=symbol, name=name,
-            entry_price=price, entry_time=time.time(),
-            sol_invested=CFG.SNIPER_BUY_SOL,
-            strategy="SNIPER", peak_price=price,
-        )
-
         label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
         cprint(f"\n[SNIPER {label}] {symbol} ({name})", Fore.CYAN, bright=True)
         cprint(f"   Age: {age_sec:.0f}s | MCap: ${mcap:,.0f} | Prix: {price:.10f} SOL", Fore.CYAN)
         cprint(f"   TP: x{CFG.SNIPER_TP_MULT} | SL: -{CFG.SNIPER_SL_PCT*100:.0f}% | {CFG.SNIPER_BUY_SOL} SOL investi", Fore.CYAN)
 
-        if not CFG.DRY_RUN:
-            # Ici : intégrer Jupiter swap
-            # result = await jupiter_swap(mint, CFG.SNIPER_BUY_SOL)
-            pass
+        token_amount = 0
+        tx_sig       = ""
 
+        if not CFG.DRY_RUN:
+            result = self.jupiter.buy(mint, CFG.SNIPER_BUY_SOL)
+            if not result:
+                cprint(f"   Achat ECHOUE pour {symbol}, on passe.", Fore.RED)
+                return
+            tx_sig, token_amount = result
+
+        pos = Position(
+            mint=mint, symbol=symbol, name=name,
+            entry_price=price, entry_time=time.time(),
+            sol_invested=CFG.SNIPER_BUY_SOL,
+            strategy="SNIPER", peak_price=price,
+            token_amount=token_amount,
+            tx_sig_buy=tx_sig,
+        )
         self.pm.open(pos)
 
     async def monitor(self):
@@ -435,10 +616,14 @@ class SniperBot:
             pos.peak_price = max(pos.peak_price, price)
             reason = None
 
-            # TP partiel
+            # TP partiel (vend 50% au premier TP)
             if not pos.partial_sold and mult >= CFG.SNIPER_TP_MULT:
                 pos.partial_sold = True
                 cprint(f"  [SNIPER] {pos.symbol} TP1 x{mult:.1f} — vente partielle 50%", Fore.GREEN)
+                if not CFG.DRY_RUN and self.jupiter and pos.token_amount > 0:
+                    sell_amount = pos.token_amount // 2
+                    self.jupiter.sell(mint, sell_amount)
+                    pos.token_amount -= sell_amount
 
             # Trailing stop après TP1
             if pos.partial_sold:
@@ -453,22 +638,30 @@ class SniperBot:
                 reason = f"TIMEOUT {dur_min:.0f}min"
 
             if reason:
+                if not CFG.DRY_RUN and self.jupiter and pos.token_amount > 0:
+                    self.jupiter.sell(mint, pos.token_amount)
                 closed = self.pm.close(mint, price, reason)
                 if closed:
                     ok = closed.pnl_sol > 0
                     emoji = "OK" if ok else "XX"
                     color = Fore.GREEN if ok else Fore.RED
-                    cprint(f"  [{emoji}][SNIPER] {pos.symbol} — {reason} | x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL", color, bright=True)
+                    cprint(
+                        f"  [{emoji}][SNIPER] {pos.symbol} — {reason} | "
+                        f"x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL",
+                        color, bright=True
+                    )
 
 
 # ================================================================
 # MODULE 2 — HYPE DETECTOR
 # ================================================================
 class HypeBot:
-    def __init__(self, pm: PositionManager, dex: DexScreener, rug: RugFilter):
-        self.pm       = pm
-        self.dex      = dex
-        self.rug      = rug
+    def __init__(self, pm: PositionManager, dex: DexScreener,
+                 rug: RugFilter, jupiter: Optional[JupiterSwap] = None):
+        self.pm          = pm
+        self.dex         = dex
+        self.rug         = rug
+        self.jupiter     = jupiter
         self.seen_today: set = set()
 
     async def scan(self):
@@ -504,7 +697,7 @@ class HypeBot:
 
             if age_min < CFG.HYPE_MIN_AGE_MIN:
                 continue
-            if age_min > 20:   # Max 20min — apres c'est souvent deja pompe
+            if age_min > CFG.HYPE_MAX_AGE_MIN:
                 continue
             if age_h > CFG.HYPE_MAX_AGE_H:
                 continue
@@ -534,22 +727,29 @@ class HypeBot:
             self.seen_today.add(mint)
 
     async def _buy(self, mint, symbol, name, price, age_min, change5m, vol5m, mcap, source):
-        pos = Position(
-            mint=mint, symbol=symbol, name=name,
-            entry_price=price, entry_time=time.time(),
-            sol_invested=CFG.HYPE_BUY_SOL,
-            strategy="HYPE", peak_price=price,
-        )
-
         label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
         cprint(f"\n[HYPE {label}] {symbol} ({name}) [{source}]", Fore.MAGENTA, bright=True)
         cprint(f"   Age: {age_min:.0f}min | +{change5m:.1f}% en 5min | Vol5m: ${vol5m:,.0f}", Fore.MAGENTA)
         cprint(f"   MCap: ${mcap:,.0f} | TP: x{CFG.HYPE_TP_MULT} | SL: -{CFG.HYPE_SL_PCT*100:.0f}%", Fore.MAGENTA)
 
-        if not CFG.DRY_RUN:
-            # Ici : intégrer Jupiter swap
-            pass
+        token_amount = 0
+        tx_sig       = ""
 
+        if not CFG.DRY_RUN:
+            result = self.jupiter.buy(mint, CFG.HYPE_BUY_SOL)
+            if not result:
+                cprint(f"   Achat ECHOUE pour {symbol}, on passe.", Fore.RED)
+                return
+            tx_sig, token_amount = result
+
+        pos = Position(
+            mint=mint, symbol=symbol, name=name,
+            entry_price=price, entry_time=time.time(),
+            sol_invested=CFG.HYPE_BUY_SOL,
+            strategy="HYPE", peak_price=price,
+            token_amount=token_amount,
+            tx_sig_buy=tx_sig,
+        )
         self.pm.open(pos)
 
     async def monitor(self):
@@ -585,25 +785,31 @@ class HypeBot:
                 reason = f"TIMEOUT {dur_min:.0f}min"
 
             if reason:
+                if not CFG.DRY_RUN and self.jupiter and pos.token_amount > 0:
+                    self.jupiter.sell(mint, pos.token_amount)
                 closed = self.pm.close(mint, price, reason)
                 if closed:
                     ok = closed.pnl_sol > 0
                     emoji = "OK" if ok else "XX"
                     color = Fore.GREEN if ok else Fore.RED
-                    cprint(f"  [{emoji}][HYPE] {pos.symbol} — {reason} | x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL", color, bright=True)
+                    cprint(
+                        f"  [{emoji}][HYPE] {pos.symbol} — {reason} | "
+                        f"x{mult:.2f} | PnL: {closed.pnl_sol:+.4f} SOL",
+                        color, bright=True
+                    )
 
 
 # ================================================================
 # BOUCLE PRINCIPALE
 # ================================================================
-async def main_loop():
+async def main_loop(jupiter: Optional[JupiterSwap] = None):
     dex  = DexScreener()
     pump = PumpFunAPI()
     rug  = RugFilter()
     pm   = PositionManager()
 
-    sniper = SniperBot(pm, dex, pump, rug)
-    hype   = HypeBot(pm, dex, rug)
+    sniper = SniperBot(pm, dex, pump, rug, jupiter)
+    hype   = HypeBot(pm, dex, rug, jupiter)
 
     mode = "DRY RUN" if CFG.DRY_RUN else "LIVE"
     cprint("=" * 60, Fore.WHITE, bright=True)
@@ -611,6 +817,9 @@ async def main_loop():
     cprint(f"  Sniper : {CFG.SNIPER_BUY_SOL} SOL | TP x{CFG.SNIPER_TP_MULT} | SL -{CFG.SNIPER_SL_PCT*100:.0f}%", Fore.WHITE)
     cprint(f"  Hype   : {CFG.HYPE_BUY_SOL} SOL | TP x{CFG.HYPE_TP_MULT} | SL -{CFG.HYPE_SL_PCT*100:.0f}%", Fore.WHITE)
     cprint(f"  Budget max/jour : {CFG.MAX_DAILY_SOL} SOL", Fore.WHITE)
+    if not CFG.DRY_RUN and jupiter:
+        bal = jupiter.wallet.get_balance_sol()
+        cprint(f"  Wallet : {jupiter.wallet.pubkey[:16]}... | Solde : {bal:.4f} SOL", Fore.YELLOW)
     cprint("=" * 60, Fore.WHITE, bright=True)
 
     cycle = 0
@@ -640,28 +849,44 @@ async def main_loop():
 # ================================================================
 def main():
     parser = argparse.ArgumentParser(description="Solana Sniper + Hype Bot")
-    parser.add_argument("--live",        action="store_true", help="Vrais achats")
-    parser.add_argument("--sniper-sol",  type=float, help="SOL par trade sniper")
-    parser.add_argument("--hype-sol",    type=float, help="SOL par trade hype")
-    parser.add_argument("--max-daily",   type=float, help="Budget journalier max SOL")
+    parser.add_argument("--live",            action="store_true", help="Vrais achats")
+    parser.add_argument("--sniper-sol",      type=float,          help="SOL par trade sniper")
+    parser.add_argument("--hype-sol",        type=float,          help="SOL par trade hype")
+    parser.add_argument("--max-daily",       type=float,          help="Budget journalier max SOL")
+    parser.add_argument("--slippage-bps",    type=int,            help="Slippage en bps (défaut: 300 = 3%%)")
     parser.add_argument("--require-socials", action="store_true")
     args = parser.parse_args()
 
-    if args.sniper_sol:       CFG.SNIPER_BUY_SOL   = args.sniper_sol
-    if args.hype_sol:         CFG.HYPE_BUY_SOL      = args.hype_sol
-    if args.max_daily:        CFG.MAX_DAILY_SOL      = args.max_daily
-    if args.require_socials:  CFG.REQUIRE_SOCIALS    = True
+    if args.sniper_sol:      CFG.SNIPER_BUY_SOL   = args.sniper_sol
+    if args.hype_sol:        CFG.HYPE_BUY_SOL      = args.hype_sol
+    if args.max_daily:       CFG.MAX_DAILY_SOL      = args.max_daily
+    if args.slippage_bps:    CFG.SLIPPAGE_BPS       = args.slippage_bps
+    if args.require_socials: CFG.REQUIRE_SOCIALS    = True
+
+    jupiter = None
 
     if args.live:
-        if not CFG.PRIVATE_KEY:
-            print("Clé privée manquante dans .env")
+        if not CFG.HELIUS_API_KEY:
+            print("HELIUS_API_KEY manquant dans .env (nécessaire pour le mode LIVE)")
             sys.exit(1)
+        if not HAS_SOLANA:
+            print("Dépendances manquantes. Lance : pip install solders solana")
+            sys.exit(1)
+
         confirm = input("Mode LIVE — vrais SOL depenses. Confirmer ? (oui/non) : ")
         if confirm.strip().lower() != "oui":
             sys.exit(0)
+
+        try:
+            wallet  = WalletManager(CFG.PRIVATE_KEY, CFG.HELIUS_RPC_URL)
+            jupiter = JupiterSwap(wallet)
+        except (ValueError, RuntimeError) as e:
+            print(f"Erreur wallet : {e}")
+            sys.exit(1)
+
         CFG.DRY_RUN = False
 
-    asyncio.run(main_loop())
+    asyncio.run(main_loop(jupiter))
 
 
 if __name__ == "__main__":
