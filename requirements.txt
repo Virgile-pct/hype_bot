@@ -1,0 +1,7 @@
+requests>=2.31.0
+python-dotenv>=1.0.0
+colorama>=0.4.6
+
+# Requis uniquement pour le mode LIVE (--live)
+solders>=0.21.0
+solana>=0.34.0
