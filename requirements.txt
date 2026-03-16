@@ -3,8 +3,7 @@ python-dotenv>=1.0.0
 colorama>=0.4.6
 
 # WebSocket temps réel (sniper)
-python-socketio[asyncio_client]>=5.11.0
-aiohttp>=3.9.0
+websockets>=12.0
 
 # Requis uniquement pour le mode LIVE (--live)
 solders>=0.21.0

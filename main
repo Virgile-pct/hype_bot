@@ -422,60 +422,92 @@ class PumpFunAPI:
 # PUMP.FUN WEBSOCKET — détection temps réel des nouveaux tokens
 # ================================================================
 class PumpFunWebSocket:
-    """Connexion Socket.IO temps réel à Pump.fun.
+    """Connexion WebSocket temps réel via pumpportal.fun.
     Remplace le polling HTTP : latence < 1s vs 5s.
     Fallback automatique vers HTTP polling si indisponible."""
 
-    WS_URL = "https://frontend-api.pump.fun"
+    WS_URL = "wss://pumpportal.fun/api/data"
 
     def __init__(self):
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=500)
-        self._sio = None
+        self._ws = None
         self._connected = False
-        self._available = False
+        self._task: Optional[asyncio.Task] = None
 
     async def start(self):
-        """Démarre la connexion WebSocket. Non-bloquant."""
+        """Démarre la connexion WebSocket en tâche de fond. Non-bloquant."""
         try:
-            import socketio  # type: ignore
-            self._sio = socketio.AsyncClient(
-                reconnection=True,
-                reconnection_attempts=0,
-                reconnection_delay=3,
-                reconnection_delay_max=30,
-                logger=False,
-                engineio_logger=False,
-            )
-
-            @self._sio.on("newCoinCreated")
-            async def _on_coin(data):
-                try:
-                    self._queue.put_nowait(data)
-                except asyncio.QueueFull:
-                    pass  # Queue pleine : on perd le token (acceptable)
-
-            @self._sio.on("connect")
-            async def _on_connect():
-                self._connected = True
-                self._available = True
-                log.info("PumpFun WebSocket connecte — sniper en temps reel")
-
-            @self._sio.on("disconnect")
-            async def _on_disconnect():
-                self._connected = False
-                log.warning("PumpFun WebSocket deconnecte — reconnexion auto...")
-
-            await self._sio.connect(self.WS_URL, transports=["websocket"])
-            self._available = True
-
+            import websockets  # type: ignore
+            self._task = asyncio.create_task(self._run(websockets))
+            # Laisser la tâche démarrer
+            await asyncio.sleep(0.5)
         except ImportError:
-            log.warning("python-socketio absent — fallback HTTP polling (pip install python-socketio[asyncio_client] aiohttp)")
+            log.warning("websockets absent — fallback HTTP polling (pip install websockets)")
         except Exception as e:
             log.warning(f"PumpFun WebSocket indisponible : {e} — fallback HTTP polling")
 
+    async def _run(self, websockets_module):
+        """Boucle de connexion avec reconnexion automatique."""
+        delay = 2
+        while True:
+            try:
+                async with websockets_module.connect(
+                    self.WS_URL,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    open_timeout=10,
+                ) as ws:
+                    self._ws = ws
+                    self._connected = True
+                    delay = 2  # reset backoff
+                    log.info("PumpPortal WebSocket connecte — sniper en temps reel")
+
+                    # S'abonner aux nouveaux tokens
+                    import json
+                    await ws.send(json.dumps({"method": "subscribeNewToken"}))
+
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                            # Normaliser le format pumpportal → format attendu par SniperBot
+                            token = self._normalize(data)
+                            if token:
+                                try:
+                                    self._queue.put_nowait(token)
+                                except asyncio.QueueFull:
+                                    pass
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                self._connected = False
+                self._ws = None
+                log.warning(f"PumpPortal WebSocket deconnecte : {e} — reconnexion dans {delay}s")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+
+    @staticmethod
+    def _normalize(data: dict) -> Optional[dict]:
+        """Convertit un event pumpportal au format attendu par SniperBot."""
+        mint = data.get("mint")
+        if not mint:
+            return None
+        return {
+            "mint":               mint,
+            "name":               data.get("name", ""),
+            "symbol":             data.get("symbol", ""),
+            "created_timestamp":  data.get("timestamp", time.time() * 1000),
+            "twitter":            data.get("twitter", ""),
+            "website":            data.get("website", ""),
+            "bonding_curve_progress": data.get("vSolInBondingCurve", 0),
+            "dev_sold":           False,
+        }
+
     async def stop(self):
-        if self._sio and self._connected:
-            await self._sio.disconnect()
+        if self._task:
+            self._task.cancel()
+        if self._ws:
+            await self._ws.close()
 
     @property
     def is_live(self) -> bool:
