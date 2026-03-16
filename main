@@ -456,10 +456,6 @@ class PumpFunWebSocket:
                     ping_interval=20,
                     ping_timeout=10,
                     open_timeout=10,
-                    extra_headers={
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                        "Origin": "https://pump.fun",
-                    },
                 ) as ws:
                     self._ws = ws
                     self._connected = True
