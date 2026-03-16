@@ -115,7 +115,7 @@ class Config:
     DRY_RUN: bool      = True
     LOG_FILE: str      = "sniper_hype.log"
     CSV_FILE: str      = "sniper_trades.csv"
-    SCAN_INTERVAL: int = 5           # Secondes entre chaque scan (fallback HTTP)
+    SCAN_INTERVAL: int = 1           # Secondes entre chaque scan (fallback HTTP)
 
     @property
     def HELIUS_RPC_URL(self) -> str:
@@ -456,6 +456,10 @@ class PumpFunWebSocket:
                     ping_interval=20,
                     ping_timeout=10,
                     open_timeout=10,
+                    extra_headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Origin": "https://pump.fun",
+                    },
                 ) as ws:
                     self._ws = ws
                     self._connected = True
