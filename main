@@ -104,11 +104,18 @@ class Config:
     SLIPPAGE_BPS: int      = 300     # 3% slippage toléré
     MIN_SOL_BALANCE: float = 0.05    # SOL minimum gardé pour les fees réseau
 
+    # Priority fees (sniper) — 0 = auto Jupiter, sinon en micro-lamports
+    # Ex: 500_000 micro-lamports ~ 0.0005 SOL de priority fee (passage rapide)
+    SNIPER_PRIORITY_FEE: int = 500_000
+
+    # WebSocket Pump.fun — détection temps réel (< 1s vs polling 5s)
+    WS_ENABLED: bool = True
+
     # Général
     DRY_RUN: bool      = True
     LOG_FILE: str      = "sniper_hype.log"
     CSV_FILE: str      = "sniper_trades.csv"
-    SCAN_INTERVAL: int = 5           # Secondes entre chaque scan
+    SCAN_INTERVAL: int = 5           # Secondes entre chaque scan (fallback HTTP)
 
     @property
     def HELIUS_RPC_URL(self) -> str:
@@ -231,14 +238,16 @@ class JupiterSwap:
                 time.sleep(2 ** attempt)
         return None
 
-    def _send_swap(self, quote: dict) -> Optional[Tuple[str, int]]:
-        """Envoie la transaction de swap. Retourne (signature, out_amount) ou None."""
+    def _send_swap(self, quote: dict, priority_fee: Optional[int] = None) -> Optional[Tuple[str, int]]:
+        """Envoie la transaction de swap. Retourne (signature, out_amount) ou None.
+        priority_fee: micro-lamports (None = auto Jupiter, 0 = auto, >0 = fixe)."""
+        fee_value = "auto" if not priority_fee else priority_fee
         payload = {
             "quoteResponse":              quote,
             "userPublicKey":              self.wallet.pubkey,
             "wrapAndUnwrapSol":           True,
             "dynamicComputeUnitLimit":    True,
-            "prioritizationFeeLamports":  "auto",
+            "prioritizationFeeLamports":  fee_value,
         }
         for attempt in range(3):
             try:
@@ -279,7 +288,8 @@ class JupiterSwap:
                 time.sleep(2 ** attempt)
         return None
 
-    def buy(self, token_mint: str, sol_amount: float) -> Optional[Tuple[str, int]]:
+    def buy(self, token_mint: str, sol_amount: float,
+            priority_fee: Optional[int] = None) -> Optional[Tuple[str, int]]:
         """Achète token_mint avec sol_amount SOL.
         Retourne (signature_tx, token_amount_reçu) ou None si échec."""
         ok, msg = self.wallet.check_balance(sol_amount)
@@ -292,7 +302,7 @@ class JupiterSwap:
         if not quote:
             return None
 
-        result = self._send_swap(quote)
+        result = self._send_swap(quote, priority_fee=priority_fee)
         if result:
             sig, out_amount = result
             cprint(f"   Achat OK : {out_amount} tokens | tx: {sig[:16]}...", Fore.GREEN)
@@ -406,6 +416,80 @@ class PumpFunAPI:
             return data if isinstance(data, list) else []
         except:
             return []
+
+
+# ================================================================
+# PUMP.FUN WEBSOCKET — détection temps réel des nouveaux tokens
+# ================================================================
+class PumpFunWebSocket:
+    """Connexion Socket.IO temps réel à Pump.fun.
+    Remplace le polling HTTP : latence < 1s vs 5s.
+    Fallback automatique vers HTTP polling si indisponible."""
+
+    WS_URL = "https://frontend-api.pump.fun"
+
+    def __init__(self):
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._sio = None
+        self._connected = False
+        self._available = False
+
+    async def start(self):
+        """Démarre la connexion WebSocket. Non-bloquant."""
+        try:
+            import socketio  # type: ignore
+            self._sio = socketio.AsyncClient(
+                reconnection=True,
+                reconnection_attempts=0,
+                reconnection_delay=3,
+                reconnection_delay_max=30,
+                logger=False,
+                engineio_logger=False,
+            )
+
+            @self._sio.on("newCoinCreated")
+            async def _on_coin(data):
+                try:
+                    self._queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    pass  # Queue pleine : on perd le token (acceptable)
+
+            @self._sio.on("connect")
+            async def _on_connect():
+                self._connected = True
+                self._available = True
+                log.info("PumpFun WebSocket connecte — sniper en temps reel")
+
+            @self._sio.on("disconnect")
+            async def _on_disconnect():
+                self._connected = False
+                log.warning("PumpFun WebSocket deconnecte — reconnexion auto...")
+
+            await self._sio.connect(self.WS_URL, transports=["websocket"])
+            self._available = True
+
+        except ImportError:
+            log.warning("python-socketio absent — fallback HTTP polling (pip install python-socketio[asyncio_client] aiohttp)")
+        except Exception as e:
+            log.warning(f"PumpFun WebSocket indisponible : {e} — fallback HTTP polling")
+
+    async def stop(self):
+        if self._sio and self._connected:
+            await self._sio.disconnect()
+
+    @property
+    def is_live(self) -> bool:
+        return self._connected
+
+    def drain(self) -> list:
+        """Retourne tous les tokens en attente (non-bloquant)."""
+        tokens = []
+        while True:
+            try:
+                tokens.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return tokens
 
 
 # ================================================================
@@ -554,17 +638,25 @@ class PositionManager:
 class SniperBot:
     def __init__(self, pm: PositionManager, dex: DexScreener,
                  pump: PumpFunAPI, rug: RugFilter,
-                 jupiter: Optional[JupiterSwap] = None):
+                 jupiter: Optional[JupiterSwap] = None,
+                 ws: Optional["PumpFunWebSocket"] = None):
         self.pm      = pm
         self.dex     = dex
         self.pump    = pump
         self.rug     = rug
         self.jupiter = jupiter
+        self.ws      = ws
         self.seen: set = set()
 
     async def scan(self):
-        tokens = self.pump.get_latest_tokens(50)
-        now    = time.time()
+        # WebSocket temps réel si dispo, sinon fallback HTTP polling
+        if self.ws and self.ws.is_live:
+            tokens = self.ws.drain()
+        else:
+            tokens = self.pump.get_latest_tokens(50)
+
+        now = time.time()
+        candidates = []
 
         for token in tokens:
             mint = token.get("mint", "")
@@ -578,34 +670,39 @@ class SniperBot:
                 self.seen.add(mint)
                 continue
 
-            ok, reason = self.rug.check_pumpfun(token)
+            ok, _ = self.rug.check_pumpfun(token)
             if not ok:
                 self.seen.add(mint)
                 continue
 
+            candidates.append((mint, token, age_sec))
+
+        if not candidates:
+            return
+
+        # Vérification DexScreener en parallèle pour tous les candidats
+        async def check_candidate(mint, token, age_sec):
             pairs = self.dex.get_pairs_by_token(mint)
+            self.seen.add(mint)
             if not pairs:
-                self.seen.add(mint)
-                continue
-
+                return
             pair = pairs[0]
-            ok2, reason2 = self.rug.check_pair(pair, "SNIPER")
+            ok2, _ = self.rug.check_pair(pair, "SNIPER")
             if not ok2:
-                self.seen.add(mint)
-                continue
-
-            can, reason3 = self.pm.can_open(CFG.SNIPER_BUY_SOL)
+                return
+            can, _ = self.pm.can_open(CFG.SNIPER_BUY_SOL)
             if not can:
-                self.seen.add(mint)
-                continue
-
+                return
             price  = float(pair.get("priceNative") or 0)
             symbol = (pair.get("baseToken") or {}).get("symbol", "???")
             name   = (pair.get("baseToken") or {}).get("name", "???")
             mcap   = float(pair.get("marketCap") or 0)
-
             await self._buy(mint, symbol, name, price, mcap, age_sec)
-            self.seen.add(mint)
+
+        await asyncio.gather(
+            *(check_candidate(m, t, a) for m, t, a in candidates),
+            return_exceptions=True
+        )
 
     async def _buy(self, mint, symbol, name, price, mcap, age_sec):
         label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
@@ -617,7 +714,9 @@ class SniperBot:
         tx_sig       = ""
 
         if not CFG.DRY_RUN:
-            result = self.jupiter.buy(mint, CFG.SNIPER_BUY_SOL)
+            # Priority fee élevé pour le sniper = passe avant les autres bots
+            result = self.jupiter.buy(mint, CFG.SNIPER_BUY_SOL,
+                                      priority_fee=CFG.SNIPER_PRIORITY_FEE)
             if not result:
                 cprint(f"   Achat ECHOUE pour {symbol}, on passe.", Fore.RED)
                 return
@@ -639,10 +738,10 @@ class SniperBot:
         if not sniper_pos:
             return
 
-        for mint, pos in list(sniper_pos.items()):
+        async def _check(mint, pos):
             pairs = self.dex.get_pairs_by_token(mint)
             if not pairs:
-                continue
+                return
 
             price   = float(pairs[0].get("priceNative") or pos.entry_price)
             mult    = price / pos.entry_price if pos.entry_price else 0
@@ -686,6 +785,11 @@ class SniperBot:
                         color, bright=True
                     )
 
+        await asyncio.gather(
+            *(_check(m, p) for m, p in list(sniper_pos.items())),
+            return_exceptions=True
+        )
+
 
 # ================================================================
 # MODULE 2 — HYPE DETECTOR
@@ -707,8 +811,44 @@ class HypeBot:
         for tokens, source in sources:
             await self._analyze(tokens, source)
 
+    @staticmethod
+    def _score(pair: dict, age_min: float) -> float:
+        """Score de qualité du signal hype (plus haut = meilleur).
+        Combine momentum prix, volume et timing optimal."""
+        change5m = float((pair.get("priceChange") or {}).get("m5") or 0)
+        change1h = float((pair.get("priceChange") or {}).get("h1") or 0)
+        vol5m    = float((pair.get("volume") or {}).get("m5") or 0)
+        txns     = (pair.get("txns") or {}).get("m5") or {}
+        buys     = int(txns.get("buys") or 0)
+        sells    = int(txns.get("sells") or 0)
+        liq      = float((pair.get("liquidity") or {}).get("usd") or 0)
+        mcap     = float(pair.get("marketCap") or 1)
+
+        # Momentum pondéré (5min compte plus que 1h)
+        momentum = change5m * 0.7 + max(change1h, 0) * 0.3
+
+        # Ratio acheteurs/vendeurs (0.5 à 2)
+        buy_ratio = buys / max(buys + sells, 1)
+        ratio_score = min(buy_ratio * 2, 2.0)
+
+        # Fenêtre d'âge optimale : 7-12 min = score max
+        if 7 <= age_min <= 12:
+            age_score = 1.0
+        elif age_min < 7:
+            age_score = age_min / 7
+        else:
+            age_score = max(0, 1 - (age_min - 12) / 8)
+
+        # Volume normalisé (log scale)
+        import math
+        vol_score = math.log10(max(vol5m, 1)) / math.log10(100_000)
+
+        return momentum * ratio_score * age_score * vol_score
+
     async def _analyze(self, items: list, source: str):
         now = time.time()
+        scored_candidates = []
+
         for item in items:
             mint = (item.get("tokenAddress") or
                     (item.get("baseToken") or {}).get("address", ""))
@@ -745,21 +885,35 @@ class HypeBot:
             if change5m < CFG.HYPE_PRICE_ACCEL * 100:
                 continue
 
-            ok, reason = self.rug.check_pair(pair, "HYPE")
+            ok, _ = self.rug.check_pair(pair, "HYPE")
             if not ok:
                 continue
 
-            can, reason2 = self.pm.can_open(CFG.HYPE_BUY_SOL)
-            if not can:
-                continue
+            score = self._score(pair, age_min)
+            scored_candidates.append((score, mint, pair, age_min, change5m, vol5m))
 
-            price  = float(pair.get("priceNative") or 0)
-            symbol = (pair.get("baseToken") or {}).get("symbol", "???")
-            name   = (pair.get("baseToken") or {}).get("name", "???")
-            mcap   = float(pair.get("marketCap") or 0)
+        if not scored_candidates:
+            return
 
-            await self._buy(mint, symbol, name, price, age_min, change5m, vol5m, mcap, source)
-            self.seen_today.add(mint)
+        # Ne prend que le meilleur signal du cycle (évite le FOMO sur tout)
+        scored_candidates.sort(key=lambda x: x[0], reverse=True)
+        best = scored_candidates[0]
+        _, mint, pair, age_min, change5m, vol5m = best
+
+        can, _ = self.pm.can_open(CFG.HYPE_BUY_SOL)
+        if not can:
+            return
+
+        price  = float(pair.get("priceNative") or 0)
+        symbol = (pair.get("baseToken") or {}).get("symbol", "???")
+        name   = (pair.get("baseToken") or {}).get("name", "???")
+        mcap   = float(pair.get("marketCap") or 0)
+
+        await self._buy(mint, symbol, name, price, age_min, change5m, vol5m, mcap, source)
+        self.seen_today.add(mint)
+        # Marquer aussi les autres candidats pour éviter de les reprendre
+        for _, m, _, _, _, _ in scored_candidates[1:]:
+            self.seen_today.add(m)
 
     async def _buy(self, mint, symbol, name, price, age_min, change5m, vol5m, mcap, source):
         label = "DRY RUN" if CFG.DRY_RUN else "LIVE"
@@ -793,10 +947,10 @@ class HypeBot:
         if not hype_pos:
             return
 
-        for mint, pos in list(hype_pos.items()):
+        async def _check(mint, pos):
             pairs = self.dex.get_pairs_by_token(mint)
             if not pairs:
-                continue
+                return
 
             price   = float(pairs[0].get("priceNative") or pos.entry_price)
             mult    = price / pos.entry_price if pos.entry_price else 0
@@ -833,6 +987,11 @@ class HypeBot:
                         color, bright=True
                     )
 
+        await asyncio.gather(
+            *(_check(m, p) for m, p in list(hype_pos.items())),
+            return_exceptions=True
+        )
+
 
 # ================================================================
 # BOUCLE PRINCIPALE
@@ -843,7 +1002,13 @@ async def main_loop(jupiter: Optional[JupiterSwap] = None):
     rug  = RugFilter()
     pm   = PositionManager()
 
-    sniper = SniperBot(pm, dex, pump, rug, jupiter)
+    # WebSocket Pump.fun temps réel
+    ws = None
+    if CFG.WS_ENABLED:
+        ws = PumpFunWebSocket()
+        await ws.start()
+
+    sniper = SniperBot(pm, dex, pump, rug, jupiter, ws=ws)
     hype   = HypeBot(pm, dex, rug, jupiter)
 
     mode = "DRY RUN" if CFG.DRY_RUN else "LIVE"
@@ -852,29 +1017,41 @@ async def main_loop(jupiter: Optional[JupiterSwap] = None):
     cprint(f"  Sniper : {CFG.SNIPER_BUY_SOL} SOL | TP x{CFG.SNIPER_TP_MULT} | SL -{CFG.SNIPER_SL_PCT*100:.0f}%", Fore.WHITE)
     cprint(f"  Hype   : {CFG.HYPE_BUY_SOL} SOL | TP x{CFG.HYPE_TP_MULT} | SL -{CFG.HYPE_SL_PCT*100:.0f}%", Fore.WHITE)
     cprint(f"  Budget max/jour : {CFG.MAX_DAILY_SOL} SOL", Fore.WHITE)
+    if ws:
+        ws_status = "WebSocket temps reel" if ws.is_live else "HTTP polling (fallback)"
+        cprint(f"  Sniper source : {ws_status}", Fore.CYAN)
     if not CFG.DRY_RUN and jupiter:
         bal = jupiter.wallet.get_balance_sol()
         cprint(f"  Wallet : {jupiter.wallet.pubkey[:16]}... | Solde : {bal:.4f} SOL", Fore.YELLOW)
     cprint("=" * 60, Fore.WHITE, bright=True)
 
     cycle = 0
-    while True:
-        cycle += 1
-        try:
-            await sniper.scan()
-            await hype.scan()
-            await sniper.monitor()
-            await hype.monitor()
+    try:
+        while True:
+            cycle += 1
+            try:
+                # Scan et monitor en parallèle pour réduire la latence totale
+                await asyncio.gather(
+                    sniper.scan(),
+                    hype.scan(),
+                    sniper.monitor(),
+                    hype.monitor(),
+                    return_exceptions=True,
+                )
 
-            if cycle % 12 == 0:
-                cprint(f"  [{datetime.now().strftime('%H:%M:%S')}] {pm.summary()}", Fore.WHITE)
+                if cycle % 12 == 0:
+                    ws_tag = "[WS]" if (ws and ws.is_live) else "[HTTP]"
+                    cprint(f"  [{datetime.now().strftime('%H:%M:%S')}] {ws_tag} {pm.summary()}", Fore.WHITE)
 
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            log.error(f"Erreur: {e}", exc_info=True)
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                log.error(f"Erreur: {e}", exc_info=True)
 
-        await asyncio.sleep(CFG.SCAN_INTERVAL)
+            await asyncio.sleep(CFG.SCAN_INTERVAL)
+    finally:
+        if ws:
+            await ws.stop()
 
     cprint(f"\n  Arrêt — {pm.summary()}", Fore.WHITE, bright=True)
 
@@ -884,19 +1061,23 @@ async def main_loop(jupiter: Optional[JupiterSwap] = None):
 # ================================================================
 def main():
     parser = argparse.ArgumentParser(description="Solana Sniper + Hype Bot")
-    parser.add_argument("--live",            action="store_true", help="Vrais achats")
-    parser.add_argument("--sniper-sol",      type=float,          help="SOL par trade sniper")
-    parser.add_argument("--hype-sol",        type=float,          help="SOL par trade hype")
-    parser.add_argument("--max-daily",       type=float,          help="Budget journalier max SOL")
-    parser.add_argument("--slippage-bps",    type=int,            help="Slippage en bps (défaut: 300 = 3%%)")
-    parser.add_argument("--require-socials", action="store_true")
+    parser.add_argument("--live",              action="store_true", help="Vrais achats")
+    parser.add_argument("--sniper-sol",        type=float,          help="SOL par trade sniper")
+    parser.add_argument("--hype-sol",          type=float,          help="SOL par trade hype")
+    parser.add_argument("--max-daily",         type=float,          help="Budget journalier max SOL")
+    parser.add_argument("--slippage-bps",      type=int,            help="Slippage en bps (défaut: 300 = 3%%)")
+    parser.add_argument("--priority-fee",      type=int,            help="Priority fee sniper en micro-lamports (défaut: 500000)")
+    parser.add_argument("--no-websocket",      action="store_true", help="Désactiver WebSocket, utiliser HTTP polling")
+    parser.add_argument("--require-socials",   action="store_true")
     args = parser.parse_args()
 
-    if args.sniper_sol:      CFG.SNIPER_BUY_SOL   = args.sniper_sol
-    if args.hype_sol:        CFG.HYPE_BUY_SOL      = args.hype_sol
-    if args.max_daily:       CFG.MAX_DAILY_SOL      = args.max_daily
-    if args.slippage_bps:    CFG.SLIPPAGE_BPS       = args.slippage_bps
-    if args.require_socials: CFG.REQUIRE_SOCIALS    = True
+    if args.sniper_sol:      CFG.SNIPER_BUY_SOL      = args.sniper_sol
+    if args.hype_sol:        CFG.HYPE_BUY_SOL         = args.hype_sol
+    if args.max_daily:       CFG.MAX_DAILY_SOL         = args.max_daily
+    if args.slippage_bps:    CFG.SLIPPAGE_BPS          = args.slippage_bps
+    if args.priority_fee:    CFG.SNIPER_PRIORITY_FEE   = args.priority_fee
+    if args.no_websocket:    CFG.WS_ENABLED            = False
+    if args.require_socials: CFG.REQUIRE_SOCIALS        = True
 
     jupiter = None
 
